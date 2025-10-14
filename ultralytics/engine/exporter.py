@@ -148,6 +148,7 @@ def export_formats():
         ["NCNN", "ncnn", "_ncnn_model", True, True, ["batch", "half"]],
         ["IMX", "imx", "_imx_model", True, True, ["int8", "fraction", "nms"]],
         ["RKNN", "rknn", "_rknn_model", False, False, ["batch", "name"]],
+        ["DEEPX", "deepx", ".dxnn", True, False, ["batch", "dynamic", "half", "int8"]],
     ]
     return dict(zip(["Format", "Argument", "Suffix", "CPU", "GPU", "Arguments"], zip(*x)))
 
@@ -273,6 +274,7 @@ class Exporter:
         export_tfjs: Export model to TensorFlow.js format.
         export_rknn: Export model to RKNN format.
         export_imx: Export model to IMX format.
+        export_deepx: Export model to DEEPX format.
 
     Examples:
         Export a YOLOv8 model to ONNX format
@@ -322,7 +324,7 @@ class Exporter:
         flags = [x == fmt for x in fmts]
         if sum(flags) != 1:
             raise ValueError(f"Invalid export format='{fmt}'. Valid formats are {fmts}")
-        (jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle, mnn, ncnn, imx, rknn) = (
+        (jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle, mnn, ncnn, imx, rknn, deepx) = (
             flags  # export booleans
         )
 
@@ -378,6 +380,15 @@ class Exporter:
             assert self.args.name in RKNN_CHIPS, (
                 f"Invalid processor name '{self.args.name}' for Rockchip RKNN export. Valid names are {RKNN_CHIPS}."
             )
+        if deepx:
+            # DEEPX-specific argument validation and compatibility checks
+            if model.task not in {"detect", "segment", "pose"}:
+                raise ValueError(f"DEEPX export only supported for 'detect', 'segment' and 'pose' models, not '{model.task}'.")
+            if hasattr(model, 'end2end') and model.end2end:
+                raise ValueError("DEEPX export does not support end2end models.")
+            if self.args.dynamic and self.args.batch == 1:
+                LOGGER.warning("DEEPX dynamic export requires batch > 1, setting batch=4")
+                self.args.batch = 4
         if self.args.int8 and tflite:
             assert not getattr(model, "end2end", False), "TFLite INT8 export not supported for end2end models."
         if self.args.nms:
@@ -541,6 +552,8 @@ class Exporter:
             f[13] = self.export_imx()
         if rknn:
             f[14] = self.export_rknn()
+        if deepx:  # DEEPX
+            f[15], _ = self.export_deepx()
 
         # Finish
         f = [str(x) for x in f if x]  # filter out '' and None
@@ -1216,6 +1229,91 @@ class Exporter:
         return export_path
 
     @try_export
+    def export_deepx(self, prefix=colorstr("DEEPX:")):
+        """Export YOLO model to DEEPX format."""
+        
+        # 1. Runtime dependency injection with clear error handling
+        try:
+            import deepx_compiler
+            import deepx_runtime
+        except ImportError as e:
+            raise ImportError(
+                f"DEEPX dependencies not found: {e}\n"
+                f"Install with: pip install ultralytics[deepx]"
+            )
+
+        # 2. Version and compatibility checks
+        check_requirements("deepx-compiler>=1.0.0")
+        LOGGER.info(f"\n{prefix} starting export with deepx-compiler {deepx_compiler.__version__}...")
+
+        # 3. Model validation - check compatibility
+        if self.model.task not in ["detect", "segment", "pose"]:
+            raise ValueError(f"DEEPX format does not support task='{self.model.task}'. Supported: detect, segment, pose.")
+        if hasattr(self.model, 'end2end') and self.model.end2end:
+            raise ValueError("DEEPX format does not support end2end models.")
+
+        # 4. Argument validation using existing framework
+        if self.args.dynamic and not self.args.batch > 1:
+            LOGGER.warning(f"{prefix} dynamic export requires batch > 1, setting batch=4")
+            self.args.batch = 4
+        if self.args.half and self.args.int8:
+            LOGGER.warning(f"{prefix} half=True and int8=True are mutually exclusive, setting half=False")
+            self.args.half = False
+
+        # 5. Setup export path following naming convention
+        f = str(self.file).replace(self.file.suffix, f"_deepx_model{os.sep}")
+        f_output = str(Path(f) / self.file.with_suffix(".dxnn").name)
+
+        # 6. Handle quantization data if needed
+        calibration_data = None
+        if self.args.int8:
+            if not self.args.data:
+                self.args.data = DEFAULT_CFG.data or TASK2DATA[self.model.task]
+                LOGGER.warning(f"{prefix} INT8 requires calibration data, using default: {self.args.data}")
+            # Use Ultralytics base dataloader for consistency
+            calibration_data = self.get_int8_calibration_dataloader(prefix)
+
+        # 7. Minimal model modifications (external when possible)
+        export_model = self.model
+        if self.args.nms:
+            # Use external NMS wrapper instead of modifying model internals
+            export_model = DEEPXNMSWrapper(self.model, self.args)
+
+        # 8. DEEPX-specific compilation with error handling
+        try:
+            compiler_config = deepx_compiler.Config(
+                input_shape=self.im.shape,
+                batch_size=self.args.batch,
+                precision="fp16" if self.args.half else "int8" if self.args.int8 else "fp32",
+                optimization_level=getattr(self.args, 'opt_level', 'O2'),
+                target_device=self.device.type,
+                nms_enabled=self.args.nms,
+                max_detections=getattr(self.args, 'max_det', 300),
+                dynamic=self.args.dynamic
+            )
+
+            compiled_model = deepx_compiler.compile(
+                model=export_model,
+                config=compiler_config,
+                calibration_data=calibration_data,
+                output_path=f_output
+            )
+
+        except Exception as e:
+            raise RuntimeError(f"{prefix} compilation failed: {e}")
+
+        # 9. Save metadata following Ultralytics convention
+        Path(f).mkdir(parents=True, exist_ok=True)
+        YAML.save(Path(f) / "metadata.yaml", self.metadata)
+
+        # 10. Validation of exported model
+        if not Path(f_output).exists():
+            raise RuntimeError(f"{prefix} export failed - output file not created")
+
+        LOGGER.info(f"{prefix} export success, saved to {f}")
+        return f, compiled_model
+
+    @try_export
     def export_imx(self, prefix=colorstr("IMX:")):
         """Export YOLO model to IMX format."""
         assert LINUX, (
@@ -1361,6 +1459,36 @@ class Exporter:
         """Execute all callbacks for a given event."""
         for callback in self.callbacks.get(event, []):
             callback(self)
+
+
+class DEEPXNMSWrapper(torch.nn.Module):
+    """External NMS wrapper for DEEPX export compatibility."""
+    
+    def __init__(self, model, args):
+        """
+        Initialize DEEPXNMSWrapper with model and arguments.
+
+        Args:
+            model (torch.nn.Module): The YOLO model to wrap.
+            args (Namespace): Export arguments.
+        """
+        super().__init__()
+        self.model = model
+        self.args = args
+    
+    def forward(self, x):
+        """Apply DEEPX-specific modifications externally."""
+        # Apply standard model inference
+        predictions = self.model(x)
+        # DEEPX-specific post-processing would go here
+        # This is a skeleton implementation - actual DEEPX SDK integration needed
+        return self._deepx_postprocess(predictions)
+    
+    def _deepx_postprocess(self, predictions):
+        """DEEPX-specific post-processing of predictions."""
+        # Skeleton implementation - replace with actual DEEPX post-processing
+        # This should implement any DEEPX-specific output formatting
+        return predictions
 
 
 class IOSDetectModel(torch.nn.Module):

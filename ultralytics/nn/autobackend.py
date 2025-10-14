@@ -20,6 +20,48 @@ from ultralytics.utils import ARM64, IS_JETSON, LINUX, LOGGER, PYTHON_VERSION, R
 from ultralytics.utils.checks import check_requirements, check_suffix, check_version, check_yaml, is_rockchip
 from ultralytics.utils.downloads import attempt_download_asset, is_url
 
+def debug_visualize_tensor(tensor, title="AutoBackend Input Tensor", save_path=None, show=False):
+    """Debug function to visualize input tensor."""
+    try:
+        # Convert tensor to numpy if needed
+        if isinstance(tensor, torch.Tensor):
+            im_vis = tensor.cpu().numpy()
+        else:
+            im_vis = tensor
+        
+        # Handle different tensor formats
+        if len(im_vis.shape) == 4:  # NCHW format
+            im_vis = im_vis.squeeze(0).transpose(1, 2, 0)  # (H, W, C)
+        elif len(im_vis.shape) == 3:  # CHW format
+            im_vis = im_vis.transpose(1, 2, 0)  # (H, W, C)
+        
+        # Convert to displayable format
+        if im_vis.dtype == np.float32 or im_vis.dtype == np.float64:
+            # Convert from [0, 1] range to [0, 255]
+            im_vis = (im_vis * 255).astype(np.uint8)
+        
+        # Convert RGB to BGR for OpenCV
+        if im_vis.shape[-1] == 3:
+            im_vis = im_vis[:, :, ::-1]
+        
+        # Show image
+        if show:
+            cv2.imshow(title, im_vis)
+            cv2.waitKey(2000)
+            cv2.destroyAllWindows()
+        
+        # Save if path provided
+        if save_path:
+            cv2.imwrite(save_path, im_vis)
+            print(f"Tensor visualization saved to: {save_path}")
+        
+        print(f"[AutoBackend Debug] {title} - Shape: {tensor.shape if isinstance(tensor, torch.Tensor) else im_vis.shape}")
+        return im_vis
+        
+    except Exception as e:
+        print(f"[AutoBackend Debug] Failed to visualize tensor: {e}")
+        print(f"[AutoBackend Debug] Tensor info - Type: {type(tensor)}, Shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'}")
+
 
 def check_class_names(names: list | dict) -> dict[int, str]:
     """
@@ -95,6 +137,7 @@ class AutoBackend(nn.Module):
             | NCNN                  | *_ncnn_model/     |
             | IMX                   | *_imx_model/      |
             | RKNN                  | *_rknn_model/     |
+            | DEEPX                 | *.dxnn            |
 
     Attributes:
         model (torch.nn.Module): The loaded YOLO model.
@@ -120,6 +163,7 @@ class AutoBackend(nn.Module):
         ncnn (bool): Whether the model is an NCNN model.
         imx (bool): Whether the model is an IMX model.
         rknn (bool): Whether the model is an RKNN model.
+        deepx (bool): Whether the model is a DEEPX model.
         triton (bool): Whether the model is a Triton Inference Server model.
 
     Methods:
@@ -175,6 +219,7 @@ class AutoBackend(nn.Module):
             ncnn,
             imx,
             rknn,
+            deepx,
             triton,
         ) = self._model_type("" if nn_module else model)
         fp16 &= pt or jit or onnx or xml or engine or nn_module or triton  # FP16
@@ -569,6 +614,37 @@ class AutoBackend(nn.Module):
             rknn_model.init_runtime()
             metadata = w.parent / "metadata.yaml"
 
+        # DEEPX
+        elif deepx:
+            LOGGER.info(f"Loading {w} for DEEPX inference...")
+            # Import dependency
+            try:
+                from dx_engine import InferenceEngine, InferenceOption
+            except ImportError:
+                raise ImportError("DEEPX runtime not found. Install with: pip install dx-engine")
+
+            # Initialize the runtime
+            w = Path(w)
+            if not w.is_file():  # if not *.dxnn
+                w = next(w.rglob("*.dxnn"))  # get *.dxnn file from *_deepx_model dir
+            
+            # Create inference option if needed
+            option = None
+            if cuda and device.index is not None:
+                option = InferenceOption()
+                option.devices = [device.index]  # Use specific GPU device
+                option.bound_option = InferenceOption.BOUND_OPTION.NPU_ALL
+                option.use_ort = False
+            
+            # Initialize DEEPX inference engine
+            if option:
+                self.deepx_model = InferenceEngine(str(w), option)
+            else:
+                self.deepx_model = InferenceEngine(str(w))
+
+            # Look for metadata.yaml in the same directory as the model
+            metadata = w.parent / "metadata.yaml"
+
         # Any other format (unsupported)
         else:
             from ultralytics.engine.exporter import export_formats
@@ -649,6 +725,20 @@ class AutoBackend(nn.Module):
 
         # ONNX Runtime
         elif self.onnx or self.imx:
+            # Debug: Visualize input tensor before ONNX inference
+            from datetime import datetime
+            timestamp = timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            debug_output_dir = Path(self.model).parent.parent
+            debug_input_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/input'
+            debug_input_save_dir.mkdir(parents=True, exist_ok=True)
+            debug_input_save_path = Path(debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg')
+            debug_visualize_tensor(im, "AutoBackend ONNX Input", save_path=debug_input_save_path, show=False)
+            
+            # Debug: Prepare to save raw model output for comparison
+            debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
+            debug_output_save_dir.mkdir(parents=True, exist_ok=True)
+            debug_output_save_path = str(debug_output_save_dir / f'raw_output_{timestamp}.npy')
+            
             if self.dynamic:
                 im = im.cpu().numpy()  # torch to numpy
                 y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: im})
@@ -665,6 +755,7 @@ class AutoBackend(nn.Module):
                 )
                 self.session.run_with_iobinding(self.io)
                 y = self.bindings
+            
             if self.imx:
                 if self.task == "detect":
                     # boxes, conf, cls
@@ -672,6 +763,23 @@ class AutoBackend(nn.Module):
                 elif self.task == "pose":
                     # boxes, conf, kpts
                     y = np.concatenate([y[0], y[1][:, :, None], y[2][:, :, None], y[3]], axis=-1)
+            
+            # Debug: Save raw model output for comparison
+            if len(y) > 0 and hasattr(y[0], 'cpu'):
+                raw_output = y[0].cpu().numpy()
+            else:
+                raw_output = y
+            
+            for idx, output in enumerate(raw_output):
+                print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
+                print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
+
+                debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
+                debug_output_save_dir.mkdir(parents=True, exist_ok=True)
+                debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
+                
+                np.save(str(debug_output_save_path), output)
+                print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
 
         # OpenVINO
         elif self.xml:
@@ -771,6 +879,53 @@ class AutoBackend(nn.Module):
             im = im if isinstance(im, (list, tuple)) else [im]
             y = self.rknn_model.inference(inputs=im)
 
+        # DEEPX
+        elif self.deepx:
+            # Debug: Visualize input tensor before DXNN inference
+            from datetime import datetime
+            timestamp = timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            debug_output_dir = Path(self.model).parent.parent
+            debug_input_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/input'
+            debug_input_save_dir.mkdir(parents=True, exist_ok=True)
+            debug_input_save_path = Path(debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg')
+            debug_visualize_tensor(im, "AutoBackend DXNN Input", save_path=debug_input_save_path, show=False)
+            
+            # Convert torch tensor to numpy if needed
+            if isinstance(im, torch.Tensor):
+                im_np = (im.cpu().numpy() * 255).astype("uint8")
+            else:
+                im_np = (im * 255).astype("uint8")
+
+            # Prepare input for DEEPX inference engine
+            # DEEPX expects a list of numpy arrays
+            if len(im_np.shape) == 4:  # NCHW format -> HWC format
+                im_np = np.squeeze(im_np, axis=0)  # Remove batch dimension if batch size is 1
+                im_np = np.transpose(im_np, (1, 2, 0))  # Change from (C, H, W) to (H, W, C)
+                input_data = [im_np]
+            else:
+                input_data = im_np
+
+            # Run inference using DEEPX InferenceEngine
+            outputs = self.deepx_model.run(input_data)
+            
+            # # Debug: Save raw model output for comparison
+            for idx, output in enumerate(outputs):
+                print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
+                print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
+
+                debug_output_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/raw_output'
+                debug_output_save_dir.mkdir(parents=True, exist_ok=True)
+                debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
+                
+                np.save(str(debug_output_save_path), output)
+                print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
+
+            # Convert back to torch tensor
+            if isinstance(outputs, list):
+                y = [torch.from_numpy(x).to(self.device) for x in outputs]
+            else:
+                y = torch.from_numpy(outputs).to(self.device)
+
         # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
         else:
             im = im.cpu().numpy()
@@ -849,7 +1004,7 @@ class AutoBackend(nn.Module):
         Args:
             imgsz (tuple): The shape of the dummy input tensor in the format (batch_size, channels, height, width)
         """
-        warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb, self.triton, self.nn_module
+        warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb, self.triton, self.nn_module, self.deepx
         if any(warmup_types) and (self.device.type != "cpu" or self.triton):
             im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
             for _ in range(2 if self.jit else 1):
