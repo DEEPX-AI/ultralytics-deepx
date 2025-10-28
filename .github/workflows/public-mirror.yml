@@ -1,0 +1,52 @@
+name: (public-mirror)
+run-name: ${{github.triggering_actor}} - Public Mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_commit:
+        description: "Target commit from main to mirror"
+        required: true
+        type: string
+        default: "latest"
+      source_branch:
+        description: "Source branch in internal repository (use 'default' string for default branch)"
+        required: true
+        type: string
+        default: "default"
+      target_branch:
+        description: "Target branch in public repository for PR (use 'default' string for default branch)"
+        required: true
+        type: string
+        default: "default"
+      force_push:
+        description: "Force push changes"
+        required: false
+        type: boolean
+        default: false
+      force_push_option:
+        description: "Force push option (only used when force_push is true)"
+        required: false
+        type: choice
+        default: "force-with-lease"
+        options:
+          - "force-with-lease"
+          - "force"
+
+permissions: write-all
+
+jobs:
+  call_public_mirror:
+    name: Execute Public Mirror
+    uses: deepx/do_workflows-central/.github/workflows/public-mirror.yml@public-mirror
+    with:
+      target_commit: ${{ github.event.inputs.target_commit }}
+      source_branch: ${{ github.event.inputs.source_branch != 'default' && github.event.inputs.source_branch || github.event.repository.default_branch || '' }}
+      target_branch: ${{ github.event.inputs.target_branch != 'default' && github.event.inputs.target_branch || github.event.repository.default_branch || '' }}
+      force_push: ${{ github.event.inputs.force_push == 'true' }}
+      force_push_option: ${{ github.event.inputs.force_push_option }}
+      internal_repo: ${{ github.repository }}
+      public_repo: ${{ format('DEEPX-AI/{0}', github.event.repository.name) }}
+    secrets:
+      internal_token: ${{ secrets.GH_DCI_TOKEN }}
+      public_token: ${{ secrets.GC_DCI_TOKEN }}
