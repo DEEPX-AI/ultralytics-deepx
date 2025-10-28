@@ -750,6 +750,10 @@ class AutoBackend(nn.Module):
 
         # ONNX Runtime
         elif self.onnx or self.imx:
+            # Debug: Check if DEEPX_DEBUG_MODE is enabled
+            import os
+            debug_enabled = os.environ.get('DEEPX_DEBUG_MODE', '0') == '1'
+            
             # Debug: Visualize input tensor before ONNX inference
             from datetime import datetime
             timestamp = timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
@@ -758,11 +762,12 @@ class AutoBackend(nn.Module):
             debug_input_save_dir.mkdir(parents=True, exist_ok=True)
             debug_input_save_path = Path(debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg')
             debug_visualize_tensor(im, "AutoBackend ONNX Input", save_path=debug_input_save_path, show=False)
-            
-            # Debug: Prepare to save raw model output for comparison
-            debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
-            debug_output_save_dir.mkdir(parents=True, exist_ok=True)
-            debug_output_save_path = str(debug_output_save_dir / f'raw_output_{timestamp}.npy')
+
+            # Debug: Prepare to save raw model output for comparison (only if DEBUG_MODE is enabled)            
+            if debug_enabled:
+                debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
+                debug_output_save_dir.mkdir(parents=True, exist_ok=True)
+                debug_output_save_path = str(debug_output_save_dir / f'raw_output_{timestamp}.npy')
             
             if self.dynamic:
                 im = im.cpu().numpy()  # torch to numpy
@@ -789,22 +794,23 @@ class AutoBackend(nn.Module):
                     # boxes, conf, kpts
                     y = np.concatenate([y[0], y[1][:, :, None], y[2][:, :, None], y[3]], axis=-1)
             
-            # Debug: Save raw model output for comparison
-            if len(y) > 0 and hasattr(y[0], 'cpu'):
-                raw_output = y[0].cpu().numpy()
-            else:
-                raw_output = y
-            
-            for idx, output in enumerate(raw_output):
-                print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
-                print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
-
-                debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
-                debug_output_save_dir.mkdir(parents=True, exist_ok=True)
-                debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
+            # Debug: Save raw model output for comparison (only if DEBUG_MODE is enabled)
+            if debug_enabled:
+                if len(y) > 0 and hasattr(y[0], 'cpu'):
+                    raw_output = y[0].cpu().numpy()
+                else:
+                    raw_output = y
                 
-                np.save(str(debug_output_save_path), output)
-                print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
+                for idx, output in enumerate(raw_output):
+                    print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
+                    print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
+
+                    debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
+                    debug_output_save_dir.mkdir(parents=True, exist_ok=True)
+                    debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
+                    
+                    np.save(str(debug_output_save_path), output)
+                    print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
 
         # OpenVINO
         elif self.xml:
@@ -910,14 +916,19 @@ class AutoBackend(nn.Module):
 
         # DEEPX
         elif self.deepx:
+            # Debug: Check if DEEPX_DEBUG_MODE is enabled
+            import os
+            debug_enabled = os.environ.get('DEEPX_DEBUG_MODE', '0') == '1'
+            
             # Debug: Visualize input tensor before DXNN inference
-            from datetime import datetime
-            timestamp = timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            debug_output_dir = Path(self.model).parent.parent
-            debug_input_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/input'
-            debug_input_save_dir.mkdir(parents=True, exist_ok=True)
-            debug_input_save_path = Path(debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg')
-            debug_visualize_tensor(im, "AutoBackend DXNN Input", save_path=debug_input_save_path, show=False)
+            if debug_enabled:
+                from datetime import datetime
+                timestamp = timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+                debug_output_dir = Path(self.model).parent.parent
+                debug_input_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/input'
+                debug_input_save_dir.mkdir(parents=True, exist_ok=True)
+                debug_input_save_path = Path(debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg')
+                debug_visualize_tensor(im, "AutoBackend DXNN Input", save_path=debug_input_save_path, show=False)
             
             # Convert torch tensor to numpy if needed
             if isinstance(im, torch.Tensor):
@@ -937,17 +948,18 @@ class AutoBackend(nn.Module):
             # Run inference using DEEPX InferenceEngine
             outputs = self.deepx_model.run(input_data)
             
-            # # Debug: Save raw model output for comparison
-            for idx, output in enumerate(outputs):
-                print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
-                print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
+            # Debug: Save raw model output for comparison
+            if debug_enabled:
+                for idx, output in enumerate(outputs):
+                    print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
+                    print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
 
-                debug_output_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/raw_output'
-                debug_output_save_dir.mkdir(parents=True, exist_ok=True)
-                debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
-                
-                np.save(str(debug_output_save_path), output)
-                print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
+                    debug_output_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/raw_output'
+                    debug_output_save_dir.mkdir(parents=True, exist_ok=True)
+                    debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
+                    
+                    np.save(str(debug_output_save_path), output)
+                    print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
 
             # Convert back to torch tensor
             if isinstance(outputs, list):
