@@ -21,8 +21,20 @@ from ultralytics.utils.checks import check_requirements, check_suffix, check_ver
 from ultralytics.utils.downloads import attempt_download_asset, is_url
 from ultralytics.utils.nms import non_max_suppression
 
-def debug_visualize_tensor(tensor, title="AutoBackend Input Tensor", save_path=None, show=False):
-    """Debug function to visualize input tensor."""
+def debug_visualize_tensor(tensor, title="AutoBackend Input Tensor", debug_output_dir=None, rt_type="onnx", show=False):
+    """
+    Debug function to visualize input tensor with batch support.
+    
+    Args:
+        tensor: Input tensor to visualize (torch.Tensor or numpy array)
+        title: Title for the visualization
+        debug_output_dir: Base directory for debug outputs (e.g., Path to project root)
+        rt_type: Runtime type ('onnx' or 'dxnn') for save path
+        show: Whether to display the image
+    
+    Returns:
+        Visualization image as numpy array
+    """
     try:
         # Convert tensor to numpy if needed
         if isinstance(tensor, torch.Tensor):
@@ -30,9 +42,16 @@ def debug_visualize_tensor(tensor, title="AutoBackend Input Tensor", save_path=N
         else:
             im_vis = tensor
         
-        # Handle different tensor formats
-        if len(im_vis.shape) == 4:  # NCHW format
-            im_vis = im_vis.squeeze(0).transpose(1, 2, 0)  # (H, W, C)
+        # Handle different tensor formats with batch support
+        if len(im_vis.shape) == 4:  # NCHW format (batch, channel, height, width)
+            batch_size = im_vis.shape[0]
+            if batch_size == 1:
+                # Single image: NCHW -> HWC (remove batch, transpose channels)
+                im_vis = im_vis.squeeze(0).transpose(1, 2, 0)  # (H, W, C)
+            else:
+                # Multiple images: take the first image from batch for visualization
+                print(f"[AutoBackend Debug] {title} - Batch size: {batch_size}, visualizing first image")
+                im_vis = im_vis[0].transpose(1, 2, 0)  # (H, W, C)
         elif len(im_vis.shape) == 3:  # CHW format
             im_vis = im_vis.transpose(1, 2, 0)  # (H, W, C)
         
@@ -51,18 +70,52 @@ def debug_visualize_tensor(tensor, title="AutoBackend Input Tensor", save_path=N
             cv2.waitKey(2000)
             cv2.destroyAllWindows()
         
-        # Save if path provided
-        if save_path:
-            cv2.imwrite(save_path, im_vis)
-            print(f"Tensor visualization saved to: {save_path}")
+        # Save if debug_output_dir provided
+        if debug_output_dir:
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            debug_input_save_dir = debug_output_dir / f'runs/predict/{rt_type}/ultralytics_deepx/debug/input'
+            debug_input_save_dir.mkdir(parents=True, exist_ok=True)
+            debug_input_save_path = debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg'
+            cv2.imwrite(str(debug_input_save_path), im_vis)
+            print(f"Tensor visualization saved to: {debug_input_save_path}")
         
-        print(f"[AutoBackend Debug] {title} - Shape: {tensor.shape if isinstance(tensor, torch.Tensor) else im_vis.shape}")
+        print(f"[AutoBackend Debug] {title} - Shape: {tensor.shape if isinstance(tensor, torch.Tensor) else tensor.shape if hasattr(tensor, 'shape') else 'unknown'}")
         return im_vis
         
     except Exception as e:
         print(f"[AutoBackend Debug] Failed to visualize tensor: {e}")
         print(f"[AutoBackend Debug] Tensor info - Type: {type(tensor)}, Shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'}")
 
+def save_debug_output(outputs, debug_output_dir, rt_type, prefix="AutoBackend"):
+    """
+    Save DEEPX raw model outputs for debugging.
+    
+    Args:
+        outputs: Raw model outputs (numpy arrays)
+        debug_output_dir: Directory to save debug outputs
+        prefix: Prefix for log messages ("AutoBackend" or "AutoBackend Async")
+    """
+    import numpy as np
+    from datetime import datetime
+    
+    if not debug_output_dir:
+        return
+        
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+    debug_outputs = outputs if isinstance(outputs, list) else [outputs]
+    
+    for idx, output in enumerate(debug_outputs):
+        print(f"[{prefix}] Raw output[{idx}] shape: {output.shape}")
+        print(f"[{prefix}] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
+
+        debug_output_save_dir = debug_output_dir / f'runs/predict/{rt_type}/ultralytics_deepx/debug/raw_output'
+        debug_output_save_dir.mkdir(parents=True, exist_ok=True)
+        debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
+        
+        np.save(str(debug_output_save_path), output)
+        print(f"[{prefix}] Raw output saved to: {debug_output_save_path}")
+            
 
 def check_class_names(names: list | dict) -> dict[int, str]:
     """
@@ -668,6 +721,17 @@ class AutoBackend(nn.Module):
 
             # Look for metadata.yaml in the same directory as the model
             metadata = w.parent / "metadata.yaml"
+            
+            # Initialize async inference support
+            import os
+            self.deepx_async_enabled = os.environ.get('DEEPX_ASYNC_MODE', '1') == '1'
+            
+            if self.deepx_async_enabled:
+                LOGGER.info("DEEPX async inference mode enabled")
+                # Pre-allocate buffers for batch inference
+                # These will be reused for each batch to improve performance
+                self.deepx_input_buffers = []
+                self.deepx_output_buffers = []
 
         # Any other format (unsupported)
         else:
@@ -755,20 +819,10 @@ class AutoBackend(nn.Module):
             debug_enabled = os.environ.get('DEEPX_DEBUG_MODE', '0') == '1'
             
             # Debug: Visualize input tensor before ONNX inference
-            from datetime import datetime
-            timestamp = timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            debug_output_dir = Path(self.model).parent.parent
-            debug_input_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/input'
-            debug_input_save_dir.mkdir(parents=True, exist_ok=True)
-            debug_input_save_path = Path(debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg')
-            debug_visualize_tensor(im, "AutoBackend ONNX Input", save_path=debug_input_save_path, show=False)
-
-            # Debug: Prepare to save raw model output for comparison (only if DEBUG_MODE is enabled)            
             if debug_enabled:
-                debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
-                debug_output_save_dir.mkdir(parents=True, exist_ok=True)
-                debug_output_save_path = str(debug_output_save_dir / f'raw_output_{timestamp}.npy')
-            
+                debug_output_dir = Path(self.model).parent.parent
+                debug_visualize_tensor(im, "AutoBackend ONNX Input", debug_output_dir=debug_output_dir, rt_type="onnx", show=False)
+
             if self.dynamic:
                 im = im.cpu().numpy()  # torch to numpy
                 y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: im})
@@ -800,17 +854,8 @@ class AutoBackend(nn.Module):
                     raw_output = y[0].cpu().numpy()
                 else:
                     raw_output = y
-                
-                for idx, output in enumerate(raw_output):
-                    print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
-                    print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
 
-                    debug_output_save_dir = debug_output_dir / 'runs/predict/onnx/ultralytics_deepx/debug/raw_output'
-                    debug_output_save_dir.mkdir(parents=True, exist_ok=True)
-                    debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
-                    
-                    np.save(str(debug_output_save_path), output)
-                    print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
+                save_debug_output(raw_output, debug_output_dir if debug_enabled else None, rt_type="onnx", prefix="AutoBackend")
 
         # OpenVINO
         elif self.xml:
@@ -922,13 +967,8 @@ class AutoBackend(nn.Module):
             
             # Debug: Visualize input tensor before DXNN inference
             if debug_enabled:
-                from datetime import datetime
-                timestamp = timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
                 debug_output_dir = Path(self.model).parent.parent
-                debug_input_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/input'
-                debug_input_save_dir.mkdir(parents=True, exist_ok=True)
-                debug_input_save_path = Path(debug_input_save_dir / f'preprocessed_input_{timestamp}.jpg')
-                debug_visualize_tensor(im, "AutoBackend DXNN Input", save_path=debug_input_save_path, show=False)
+                debug_visualize_tensor(im, "AutoBackend DXNN Input", debug_output_dir=debug_output_dir, rt_type="dxnn", show=False)
             
             # Convert torch tensor to numpy if needed
             if isinstance(im, torch.Tensor):
@@ -938,28 +978,89 @@ class AutoBackend(nn.Module):
 
             # Prepare input for DEEPX inference engine
             # DEEPX expects a list of numpy arrays
-            if len(im_np.shape) == 4:  # NCHW format -> HWC format
-                im_np = np.squeeze(im_np, axis=0)  # Remove batch dimension if batch size is 1
-                im_np = np.transpose(im_np, (1, 2, 0))  # Change from (C, H, W) to (H, W, C)
-                input_data = [im_np]
+            if len(im_np.shape) == 4:  # NCHW format (batch, channel, height, width)
+                batch_size = im_np.shape[0]
+                
+                # Batch processing: NCHW -> list of HWC
+                input_data = []
+                for i in range(batch_size):
+                    frame = im_np[i]  # (C, H, W)
+                    frame_hwc = np.transpose(frame, (1, 2, 0))  # (H, W, C)
+                    input_data.append(frame_hwc)
             else:
                 input_data = im_np
 
             # Run inference using DEEPX InferenceEngine
-            outputs = self.deepx_model.run(input_data)
-            
-            # Debug: Save raw model output for comparison
-            if debug_enabled:
-                for idx, output in enumerate(outputs):
-                    print(f"[AutoBackend] Raw output[{idx}] shape: {output.shape}")
-                    print(f"[AutoBackend] Raw output[{idx}] range: [{output.min():.3f}, {output.max():.3f}]")
-
-                    debug_output_save_dir = debug_output_dir / 'runs/predict/dxnn/ultralytics_deepx/debug/raw_output'
-                    debug_output_save_dir.mkdir(parents=True, exist_ok=True)
-                    debug_output_save_path = debug_output_save_dir / f'raw_output{idx}_{timestamp}.npy'
+            if self.deepx_async_enabled:
+                # Asynchronous batch inference using run_batch
+                # Prepare input and output buffers for batch processing
+                batch_size = len(input_data) if isinstance(input_data, list) else 1
+                
+                # Allocate buffers if needed or if batch size changed
+                if len(self.deepx_input_buffers) != batch_size:
+                    self.deepx_input_buffers = []
+                    self.deepx_output_buffers = []
+                    for _ in range(batch_size):
+                        # Allocate input buffer (pre-fill with zeros)
+                        input_buffer = [np.zeros(self.deepx_model.get_input_size(), dtype=np.uint8)]
+                        self.deepx_input_buffers.append(input_buffer)
+                        
+                        # Allocate output buffer (pre-fill with zeros)
+                        output_buffer = [np.zeros(self.deepx_model.get_output_size(), dtype=np.uint8)]
+                        self.deepx_output_buffers.append(output_buffer)
+                
+                # Copy input data to input buffers
+                # DEEPX NPU requires fixed input shape (imgsz), so validate size before copying
+                if isinstance(input_data, list):
+                    for i, frame in enumerate(input_data):
+                        frame_flat = frame.flatten()
+                        expected_size = self.deepx_input_buffers[i][0].size
+                        if frame_flat.size != expected_size:
+                            raise ValueError(
+                                f"DEEPX input size mismatch: got {frame_flat.size} ({frame.shape}), "
+                                f"expected {expected_size}. DEEPX NPU requires fixed input shape. "
+                                f"Ensure letterbox preprocessing produces square images (imgsz={self.imgsz})."
+                            )
+                        # Flatten the frame and copy to buffer
+                        self.deepx_input_buffers[i][0][:] = frame_flat
+                else:
+                    # Single input case
+                    input_flat = input_data.flatten()
+                    expected_size = self.deepx_input_buffers[0][0].size
+                    if input_flat.size != expected_size:
+                        raise ValueError(
+                            f"DEEPX input size mismatch: got {input_flat.size} ({input_data.shape}), "
+                            f"expected {expected_size}. DEEPX NPU requires fixed input shape. "
+                            f"Ensure letterbox preprocessing produces square images (imgsz={self.imgsz})."
+                        )
+                    self.deepx_input_buffers[0][0][:] = input_flat
+                
+                # Run batch inference - operates asynchronously internally
+                # and returns results for all batches
+                results = self.deepx_model.run_batch(self.deepx_input_buffers, self.deepx_output_buffers)
+                
+                # Process results - run_batch returns a list of outputs for each batch item
+                # Each result is a list containing output arrays: results[i][0] has the output tensor
+                # DEEPX model output format: Check shape to determine if transpose is needed
+                if len(results) != batch_size:
+                    raise ValueError(f"DEEPX run_batch returned {len(results)} results, expected {batch_size}.")
+                else:
+                    # Multiple batch items: extract and concatenate output arrays from each batch item
+                    batch_outputs = []
+                    for result in results:
+                        # result is a list containing output arrays for one batch item
+                        output_array = result[0] if isinstance(result, list) else result
+                        batch_outputs.append(output_array)
                     
-                    np.save(str(debug_output_save_path), output)
-                    print(f"[AutoBackend] Raw output saved to: {debug_output_save_path}")
+                    # Concatenate along batch dimension
+                    outputs = np.concatenate(batch_outputs, axis=0)
+            else:
+                # Synchronous inference (original behavior)
+                outputs = self.deepx_model.run(input_data)
+
+            # Debug: Save raw model output for comparison (only if DEBUG_MODE is enabled)
+            if debug_enabled:
+                save_debug_output(outputs, debug_output_dir if debug_enabled else None, rt_type="dxnn", prefix="AutoBackend")
 
             # Convert back to torch tensor
             if isinstance(outputs, list):
